@@ -92,7 +92,9 @@ export function sha256Hex(text) {
 const ID_HEADER = /(编码|编号|序列号|流水号|条码|二维码|serial|code|(^|\W)id(\W|$)|sn\b|uuid|guid)/i;
 const DATE_HEADER = /(日期|时间|date|time|day)/i;
 const TEXT_HEADER = /(备注|说明|注释|评论|原因|note|comment|remark|description|memo|text)/i;
-const DATE_VALUE = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T].*)?$/;
+const DATE_VALUE = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})((?:[ T].*)?)$/;
+const EXCEL_SERIAL_MIN = 20000;
+const EXCEL_SERIAL_MAX = 80000;
 
 export function randomSalt() {
   const c = globalThis.crypto;
@@ -119,11 +121,32 @@ function looksLikeDate(value) {
   return DATE_VALUE.test(textOf(value).trim());
 }
 
+function looksLikeExcelSerial(value) {
+  return isFiniteNumber(value) && Number.isInteger(value) &&
+    value >= EXCEL_SERIAL_MIN && value <= EXCEL_SERIAL_MAX;
+}
+
+function excelSerialToDate(serial) {
+  // Excel's 1900 date system (including its historical leap-year quirk).
+  const ms = Math.round((serial - 25569) * 86400000);
+  return new Date(ms);
+}
+
+function dateToExcelSerial(date) {
+  return Math.round(date.getTime() / 86400000 + 25569);
+}
+
 function parseDate(value) {
-  if (value instanceof Date) return { y: value.getFullYear(), m: value.getMonth() + 1, d: value.getDate() };
+  if (value instanceof Date) {
+    return { y: value.getFullYear(), m: value.getMonth() + 1, d: value.getDate(), suffix: '', date: value };
+  }
+  if (looksLikeExcelSerial(value)) {
+    const date = excelSerialToDate(value);
+    return { y: date.getUTCFullYear(), m: date.getUTCMonth() + 1, d: date.getUTCDate(), suffix: '', serial: value };
+  }
   const match = DATE_VALUE.exec(textOf(value).trim());
   if (!match) return null;
-  return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
+  return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]), suffix: match[4] || '' };
 }
 
 function formatDate(y, m, d) {
@@ -132,10 +155,15 @@ function formatDate(y, m, d) {
 
 function shiftDate(value, days) {
   const parsed = parseDate(value);
-  if (!parsed) return textOf(value);
-  const date = new Date(parsed.y, parsed.m - 1, parsed.d);
+  if (!parsed) return value;
+  if (parsed.serial !== undefined) return parsed.serial + days;
+  const date = parsed.date ? new Date(parsed.date.getTime()) : new Date(parsed.y, parsed.m - 1, parsed.d);
   date.setDate(date.getDate() + days);
-  return formatDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
+  if (parsed.date) {
+    const hasTime = date.getHours() !== 0 || date.getMinutes() !== 0 || date.getSeconds() !== 0;
+    return hasTime ? date.toISOString() : formatDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
+  }
+  return formatDate(date.getFullYear(), date.getMonth() + 1, date.getDate()) + parsed.suffix;
 }
 
 /** Split non-empty text values of one column. */
@@ -167,8 +195,20 @@ export function detectColumns(headers, rows) {
     const sample = texts.slice(0, Math.min(200, texts.length));
     const dateish = sample.filter(looksLikeDate).length >= Math.max(2, sample.length * 0.7);
     const numericCount = rows.reduce((acc, row) => acc + (isFiniteNumber(row && row[c]) ? 1 : 0), 0);
+    const numericValues = rows
+      .map((row) => (row ? row[c] : null))
+      .filter((v) => isFiniteNumber(v));
 
-    if (numericCount >= nRows * 0.8) continue;
+    if (numericCount >= nRows * 0.8) {
+      // Numeric identifiers (long integer codes) and Excel serial dates are
+      // easy to overlook: a pure number is still a direct identifier.
+      if (DATE_HEADER.test(header) && numericValues.some(looksLikeExcelSerial)) {
+        dateColumns.push(c);
+      } else if (ID_HEADER.test(header) && unique.size >= Math.max(2, texts.length * 0.6)) {
+        idColumns.push(c);
+      }
+      continue;
+    }
     if (dateish || DATE_HEADER.test(header)) {
       dateColumns.push(c);
       continue;
@@ -222,7 +262,7 @@ export function desensitize(headers, rows, options = {}) {
   const groupMode = options.groupMode || 'hash';
   const textMode = options.textMode || 'mask';
   const dateShiftDays = options.dateShiftDays === null || options.dateShiftDays === undefined
-    ? 30 + (parseInt(sha256Hex(salt + '|date-shift').slice(0, 6), 16) % 300)
+    ? 7 * (5 + (parseInt(sha256Hex(salt + '|date-shift').slice(0, 6), 16) % 40))
     : Math.trunc(options.dateShiftDays);
 
   const idMap = new Map();
@@ -245,29 +285,41 @@ export function desensitize(headers, rows, options = {}) {
   };
 
   const output = rows.map((row) => (Array.isArray(row) ? row.slice() : []));
-  const summary = { idColumns, groupColumns, dateColumns, textColumns, dateShiftDays, changed: 0 };
+  const summary = { idColumns, groupColumns, dateColumns, textColumns, dateShiftDays, changed: 0, cellsChanged: 0, sensitiveCells: 0 };
+  const markChange = (before, after) => {
+    summary.sensitiveCells += 1;
+    if (String(before) !== String(after)) summary.cellsChanged += 1;
+  };
 
   for (let r = 0; r < output.length; r += 1) {
     const row = output[r] || [];
     for (const c of idColumns) {
       const raw = textOf(row[c]).trim();
       if (!raw) continue;
+      const before = row[c];
       row[c] = idMode === 'keep' ? row[c] : idMode === 'sequence' ? sequential('P-', raw, idSeq) : token('P-', raw, idMap);
+      markChange(before, row[c]);
     }
     for (const c of groupColumns) {
       const raw = textOf(row[c]).trim();
       if (!raw) continue;
+      const before = row[c];
       row[c] = groupMode === 'keep' ? row[c] : groupMode === 'sequence' ? sequential('G-', raw, groupSeq) : token('G-', raw, groupMap);
+      markChange(before, row[c]);
     }
     for (const c of dateColumns) {
       if (row[c] === null || row[c] === undefined || row[c] === '') continue;
+      const before = row[c];
       row[c] = shiftDate(row[c], dateShiftDays);
+      markChange(before, row[c]);
     }
     for (const c of textColumns) {
       if (textMode === 'keep') continue;
       const raw = textOf(row[c]).trim();
       if (!raw) continue;
+      const before = row[c];
       row[c] = textMode === 'drop' ? '' : token('T-', raw, textMap);
+      markChange(before, row[c]);
     }
   }
 

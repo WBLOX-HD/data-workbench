@@ -68,6 +68,33 @@ ok(fixed.rows[0][2] === '2026-01-11', 'explicit date shift');
 ok(desensitize([], []).rows.length === 0, 'empty dataset');
 ok(desensitize(['编号'], [['A']]).rows[0][0].startsWith('P-'), 'single row');
 
+// numeric identifiers and Excel serial dates must not leak
+const numericHeaders = ['编号', '生产日期', '值'];
+const numericRows = [
+  [123456789012, 46023, 1.2],
+  [123456789013, 46024, 1.3],
+];
+const numericDetected = detectColumns(numericHeaders, numericRows);
+ok(numericDetected.idColumns.includes(0), 'detect long numeric id');
+ok(numericDetected.dateColumns.includes(1), 'detect Excel serial date');
+const numericOut = desensitize(numericHeaders, numericRows, { salt: 'n', dateShiftDays: 7 });
+ok(String(numericOut.rows[0][0]).startsWith('P-'), 'numeric id is pseudonymized');
+ok(numericOut.rows[0][1] === 46030, 'Excel serial date shifted');
+ok(numericOut.rows[0][2] === 1.2, 'numeric value untouched');
+
+// time-of-day must survive the date shift
+const timeHeaders = ['编号', '生产时间'];
+const timeRows = [['A-1', '2026-01-01 08:30'], ['A-2', '2026-01-01 20:15']];
+const timeOut = desensitize(timeHeaders, timeRows, { salt: 't', dateShiftDays: 10 });
+ok(timeOut.rows[0][1] === '2026-01-11 08:30', 'time-of-day preserved');
+ok(timeOut.rows[1][1] === '2026-01-11 20:15', 'second time-of-day preserved');
+
+// default shift is a whole number of weeks so weekday/班次 relations survive
+const weekShift = desensitize(headers, rows, { salt: 'w' });
+ok(weekShift.policies.dateShiftDays % 7 === 0, 'default shift keeps weekday');
+ok(weekShift.summary.cellsChanged > 0 && weekShift.summary.sensitiveCells >= weekShift.summary.cellsChanged,
+  'summary counts actual changed cells');
+
 // random salt is non-empty and different across calls
 const s1 = randomSalt();
 const s2 = randomSalt();
