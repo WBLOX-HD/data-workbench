@@ -1,0 +1,13 @@
+{
+  "name": "data-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "通用数据分析工作台：本地解析、脱敏、统计与报告（独立项目）",
+  "scripts": {
+    "test": "node test/desensitize.test.mjs",
+    "demo": "node examples/run-demo.mjs"
+  },
+  "keywords": ["data-analysis", "desensitization", "spc", "statistics", "privacy"],
+  "license": "MIT"
+}
